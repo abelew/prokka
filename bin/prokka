@@ -19,12 +19,16 @@
 
 use strict;
 use warnings;
+###BREWCONDA###
+use FindBin;
+use Cwd qw(abs_path);
 use File::Copy;
+use File::Basename;
 use Time::Piece;
 use Time::Seconds;
 use XML::Simple;
 use Digest::MD5;
-use List::Util qw(min max sum);
+use List::Util qw(min max sum uniq);
 use Scalar::Util qw(openhandle);
 use Data::Dumper;
 use Bio::Root::Version;
@@ -34,8 +38,6 @@ use Bio::Seq;
 use Bio::SeqFeature::Generic;
 use Bio::Tools::GFF;
 use Bio::Tools::GuessSeqFormat;
-use FindBin;
-use lib "$FindBin::RealBin/../perl5"; # for bundled Perl modules
 
 # . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . 
 # global variables
@@ -44,12 +46,11 @@ my @CMDLINE = ($0, @ARGV);
 my $OPSYS = $^O;
 my $BINDIR = "$FindBin::RealBin/../binaries/$OPSYS";
 my $EXE = $FindBin::RealScript;
-my $VERSION = "1.12";
+my $VERSION = "1.14.6";
 my $AUTHOR = 'Torsten Seemann <torsten.seemann@gmail.com>';
 my $URL = 'https://github.com/tseemann/prokka';
 my $PROKKA_PMID = '24642063';
 my $PROKKA_DOI = '10.1093/bioinformatics/btu153';
-my $DBDIR = "$FindBin::RealBin/../db";
 my $HYPO = 'hypothetical protein';
 my $UNANN = 'unannotated protein';
 my $MAXCONTIGIDLEN = 37;  # Genbank rule
@@ -60,11 +61,12 @@ my @LOG; # buffer up log lines before we have log file ready
 my @GOOD_PROD = (
  'rep',
  'Conserved virulence factor B',
+ 'Cypemycin N-terminal methyltransferase',
 );
 my %GOOD_PROD = (map { ($_=>1) } @GOOD_PROD);
 
 # these should accept .faa on STDIN and write report to STDOUT
-my $BLASTPCMD = "blastp -query - -db %d -evalue %e -num_threads 1 -num_descriptions 1 -num_alignments 1 -seg no";
+my $BLASTPCMD = "blastp -query - -db %d -evalue %e -qcov_hsp_perc %c -num_threads 1 -num_descriptions 1 -num_alignments 1 -seg no";
 my $HMMER3CMD = "hmmscan --noali --notextw --acc -E %e --cpu 1 %d /dev/stdin";
 
 my $rnammer_mode = 'bac';
@@ -85,8 +87,8 @@ my $BIDEC = '(\d+\.\d+)';  # pattern of NN.NN for versions that can be compared
 
 my %tools = (
   'parallel' => {
-    GETVER  => "parallel --version | grep '^GNU parallel 2'",
-    REGEXP  => qr/GNU parallel (\d+)/,
+    GETVER  => "parallel --version | grep -E 'parallel 2[0-9]{7}\$'",
+    REGEXP  => qr/parallel (\d+)/,
     MINVER  => "20130422",
     NEEDED  => 1,
   },
@@ -103,7 +105,7 @@ my %tools = (
     NEEDED  => 0,
   },
   'barrnap' => {
-    GETVER  => "barrnap --version 2>&1",
+    GETVER  => "LC_ALL=C barrnap --version 2>&1",
     REGEXP  => qr/($BIDEC)/,  
     MINVER  => "0.4",  
     NEEDED  => 0,
@@ -112,12 +114,11 @@ my %tools = (
     GETVER  => "prodigal -v 2>&1 | grep -i '^Prodigal V'",
     REGEXP  => qr/($BIDEC)/,
     MINVER  => "2.6",
-    MAXVER  => "2.69",  # changed cmdline options in 2.70 git :-/
     NEEDED  => 1,
   },
   'signalp' => {
     # this is so long-winded as -v changed meaning (3.0=version, 4.0=verbose !?)
-    GETVER  => "signalp -v < /dev/null 2>&1 | egrep ',|# SignalP' | sed 's/^# SignalP-//'",
+    GETVER  => "if [ \"`signalp -version 2>&1 | grep -Eo '[0-9]+\.[0-9]+'`\" != \"\" ]; then echo `signalp -version 2>&1 | grep -Eo '[0-9]+\.[0-9]+'`; else signalp -v < /dev/null 2>&1 | egrep ',|# SignalP' | sed 's/^# SignalP-//'; fi",
     REGEXP  => qr/^($BIDEC)/,
     MINVER  => "3.0",
     NEEDED  => 0,  # only if --gram used
@@ -125,7 +126,7 @@ my %tools = (
   'minced' => {
      GETVER => "minced --version | sed -n '1p'",
      REGEXP => qr/minced\s+\d+\.(\d+\.\d+)/,
-     MINVER => "2.0",
+     MINVER => "2.0",  # really 0.3 as we skip first number
      NEEDED => 0,
    },
   'cmscan' => {
@@ -155,13 +156,13 @@ my %tools = (
   'blastp' => {
     GETVER  => "blastp -version",
     REGEXP  => qr/blastp:\s+($BIDEC)/,
-    MINVER  => "2.2",
+    MINVER  => "2.8",
     NEEDED  => 1,
   },
   'makeblastdb' => {
     GETVER  => "makeblastdb -version",
     REGEXP  => qr/makeblastdb:\s+($BIDEC)/,
-    MINVER  => "2.2",
+    MINVER  => "2.8",
     NEEDED  => 0,  # only if --proteins used
   },
   'tbl2asn' => {
@@ -171,7 +172,6 @@ my %tools = (
     NEEDED  => 1,
   },
   # now just the standard unix tools we need
-  'less'    => { NEEDED=>1 },
   'grep'    => { NEEDED=>1 },  # yes, we need this before we can test versions :-/
   'egrep'   => { NEEDED=>1 },
   'sed'     => { NEEDED=>1 },
@@ -184,6 +184,12 @@ my %tools = (
 # . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . 
 # functions to check if tool is installed and correct version
 
+sub ver2str {
+  my($bidec) = @_;
+  return $bidec if $bidec !~ m/\./;
+  return join '', map { sprintf "%03d",$_ } (split m/\./, $bidec);
+}
+
 sub check_tool {
   my($toolname) = @_;
   my $t = $tools{$toolname};
@@ -195,19 +201,17 @@ sub check_tool {
     if ($t->{GETVER}) {
       my($s) = qx($t->{GETVER});
       if (defined $s) {
-        $s =~ $t->{REGEXP};
-        $t->{VERSION} = $1 if defined $1;
-        msg("Determined $toolname version is $t->{VERSION}");
-        if (defined $t->{MINVER} and $t->{VERSION} < $t->{MINVER}) {
+        chomp $s;
+        $s =~ $t->{REGEXP} or err("Coult not parse version from '$s'");;
+        $t->{VERSION} = ver2str($1);
+        msg("Determined $toolname version is $t->{VERSION} from '$s'");
+        if (defined $t->{MINVER} and $t->{VERSION} lt ver2str($t->{MINVER}) ) {
           err("Prokka needs $toolname $t->{MINVER} or higher. Please upgrade and try again.");
-        }
-        if (defined $t->{MAXVER} and $t->{VERSION} > $t->{MAXVER}) {
-          err("Prokka needs a version of $toolname between $t->{MINVER} and $t->{MAXVER}. Please downgrade and try again."); 
         }
       }
       else {
         err("Could not determine version of $toolname - please install version",
-            $t->{MINVER}, "or higher");  # FIXME: or less <= MAXVER if given
+            $t->{MINVER}, "or higher");
       }
     }
   }
@@ -223,13 +227,16 @@ sub check_all_tools {
 # . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . 
 # command line options
 
-my(@Options, $quiet, $debug, $kingdom, $fast, $force, $outdir, $prefix, $cpus, 
+my(@Options, $quiet, $debug, $kingdom, $fast, $force, $outdir, $prefix, $cpus, $dbdir,
              $addgenes, $addmrna, $cds_rna_olap,
              $gcode, $gram, $gffver, $locustag, $increment, $mincontiglen, $evalue, $coverage,
-             $genus, $species, $strain, $plasmid, 
+             $genus, $species, $strain, $plasmid, $prodigaltf,
              $usegenus, $proteins, $hmms, $centre, $scaffolds,
              $rfam, $norrna, $notrna, $rnammer, $rawproduct, $noanno, $accver,
 	     $metagenome, $compliant, $listdb, $citation);
+
+$dbdir = $ENV{'PROKKA_DBDIR'} || abs_path("$FindBin::RealBin/../db");
+
 setOptions();
 
 # . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . 
@@ -246,7 +253,7 @@ msg("You have enabled DEBUG mode. Temporary files will NOT be deleted.") if $deb
 # . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . 
 # check BioPerl version 
 
-my $minbpver = "1.006002"; # for Bio::SearcIO::hmmer3
+my $minbpver = "1.006002"; # for Bio::SearchIO::hmmer3
 my $bpver = $Bio::Root::Version::VERSION;
 msg("You have BioPerl $bpver");
 err("Please install BioPerl $minbpver or higher") if $bpver < $minbpver;
@@ -316,7 +323,7 @@ msg("Annotating as >>> $kingdom <<<");
 # . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . 
 # check if --setupdb has been run
 
-if ( !  -r "$DBDIR/kingdom/$kingdom/sprot.pin" or ! "$DBDIR/hmm/HAMAP.hmm.h3i") {
+if ( !  -r "$dbdir/kingdom/$kingdom/sprot.pin" or ! -r "$dbdir/hmm/HAMAP.hmm.h3i") {
   err("The sequence databases have not been indexed. Please run 'prokka --setupdb' first.");
 }
 
@@ -337,7 +344,7 @@ if ($compliant) {
 #$centre or err("You must set --centre or the NCBI tbl2asn tool won't work properly, sorry.");
 ($gcode < 1 or $gcode > 25) and err("Invalid genetic code, must be 1..25");
 $evalue >= 0 or err("Invalid --evalue, must be >= 0");
-#($coverage >= 0 and $coverage <= 100) or err("Invalid --coverage, must be 0..100");
+($coverage >= 0 and $coverage <= 100) or err("Invalid --coverage, must be 0..100");
 $increment >= 1 or err("Invalid --increment, must be >= 1");
 # http://www.ncbi.nlm.nih.gov/genomes/static/Annotation_pipeline_README.txt
 $prefix ||= 'PROKKA_'.(localtime->mdy('')); # NCBI wants US format, ech.
@@ -356,6 +363,7 @@ else {
 }
 msg("Using filename prefix: $prefix.XXX");
 # canonical names
+my $ncgenus = $genus;
 $genus = ucfirst(lc($genus)) if $genus;
 $species = lc($species) if $strain;
 
@@ -414,7 +422,19 @@ my $fin = Bio::SeqIO->new(-file=>$in, -format=>'fasta');
 my $fout = Bio::SeqIO->new(-file=>">$outdir/$prefix.fna", -format=>'fasta');
 my $ncontig = 0;
 
-my $contigprefix = $locustag || $prefix || $outdir || $strain || '';
+my $contigprefix;
+if ($locustag) {
+    print "Setting contigprefix to ${locustag}\n";
+    $contigprefix = $locustag;
+} elsif ($prefix) {
+    $contigprefix = $prefix;
+} elsif ($outdir) {
+    $contigprefix = $outdir;
+} elsif ($strain) {
+    $contigprefix = $strain;
+} else {
+    $contigprefix = '';
+}
 $contigprefix .= '_' if $contigprefix;
 my $contig_name_len = length($centre) + 1 + length($contigprefix) + 6;
 if ($compliant) {
@@ -610,36 +630,38 @@ else {
 # . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . 
 # ncRNA via Rfam + Infernal
 
-my $cmdb = "$DBDIR/cm/$kingdom";
+my $cmdb = "$dbdir/cm/$kingdom";
 if ($rfam) {
   if (-r "$cmdb.i1m") {
     msg("Scanning for ncRNAs... please be patient.");
     my $num_ncrna = 0;
     my $tool = "Infernal:".$tools{'cmscan'}->{VERSION};
     my $icpu = $cpus || 1;
-    my $cmd = "cmscan --rfam --cpu $icpu -E $evalue --tblout /dev/stdout -o /dev/null --noali $cmdb \Q$outdir/$prefix.fna\E";
+    my $dbsize = $total_bp * 2 / 1000000;
+    my $cmd = "cmscan -Z $dbsize --cut_ga --rfam --nohmmonly --fmt 2 --cpu $icpu --tblout /dev/stdout -o /dev/null --noali $cmdb \Q$outdir/$prefix.fna\E";
     msg("Running: $cmd");
     open INFERNAL, '-|', $cmd;
     while (<INFERNAL>) {
       next if m/^#/;       # ignore comments
       my @x = split ' ';   # magic Perl whitespace splitter
-  #    msg("DEBUG: ", join("~~~", @x) );
-      next unless @x > 9;  # avoid incorrect lines
-      next unless defined $x[1] and $x[1] =~ m/^RF\d/;
-      my $sid = $x[2];
+      next unless defined $x[2] and $x[2] =~ m/^RF\d/;
+      my $sid = $x[3];
       next unless exists $seq{$sid};
+      next if defined $x[19] and $x[19] =~ m/^=$/;  # Overlaps with a higher scoring match
       push @{$seq{$sid}{FEATURE}}, Bio::SeqFeature::Generic->new( 
         -primary    => 'misc_RNA',
         -seq_id     => $sid,
         -source     => $tool,
-        -start      => min($x[7], $x[8]),
-        -end        => max($x[7], $x[8]),
-        -strand     => ($x[9] eq '-' ? -1 : +1),
-        -score      => undef,  # possibly x[16] but had problems here with '!'
+        -start      => min($x[9], $x[10]),
+        -end        => max($x[9], $x[10]),
+        -strand     => ($x[11] eq '-' ? -1 : +1),
+        -score      => $x[16],
         -frame      => 0,
         -tag        => {
-          'product' => $x[0],
+          'product' => $x[1],
           'inference' => "COORDINATES:profile:$tool",
+          'accession' => $x[2],
+          'Note' => '"' . join(' ', @x[26..$#x]) . '"',
         }
       );
       $num_ncrna++;    
@@ -670,18 +692,21 @@ msg("Total of", scalar(@allrna), "tRNA + rRNA features");
 if ($tools{'minced'}->{HAVE}) {
   msg("Searching for CRISPR repeats");
   my $num_crispr=0;
+  # ##gff-version 3
+  #                                                               [score] = # rpts
+  # JXCI01000002.1  minced:0.3.0    repeat_region   11491   12592   16      .       .
+  # ID=CRISPR1;rpt_family=CRISPR;rpt_unit_seq=GTCGAAAGACATTGCCCTGTTCCAAAGGGATTGAGAC
   open my $MINCED, '-|', "minced -gff \Q$outdir/$prefix.fna\E";
   my $gff = Bio::Tools::GFF->new(-fh => $MINCED, -gff_version => 3);
   while (my $feat = $gff->next_feature) {
-    next unless $feat->primary_tag eq 'CRISPR';
+    my $num_rpt = $feat->score; # save for later
+    $feat->remove_tag('ID');    # we don't give these a locus_tag ?
+    $feat->remove_tag('score'); # https://github.com/tseemann/prokka/issues/328
 
-    # format it properly for NCBI
-    $feat->primary_tag("repeat_region");
-    $feat->remove_tag('ID');
-    $feat->add_tag_value('rpt_family', 'CRISPR');
     # http://www.insdc.org/controlled-vocabulary-rpttype-qualifier
-    $feat->add_tag_value('rpt_type', 'direct');
-    $feat->add_tag_value('note', 'CRISPR with '.$feat->score.' repeat units');
+    $feat->add_tag_value('rpt_family', 'CRISPR') unless $feat->has_tag('rpt_family');
+    $feat->add_tag_value('rpt_type', 'direct') unless $feat->has_tag('rpt_type');
+    $feat->add_tag_value('note', "CRISPR with $num_rpt repeat units");
 
     push @{$seq{$feat->seq_id}{FEATURE}}, $feat;
 
@@ -689,7 +714,7 @@ if ($tools{'minced'}->{HAVE}) {
     # will occasionally create ORFs in these regions. Got to stop that.
     push @allrna, $feat;
     $num_crispr++;
-    msg("CRISPR$num_crispr", $feat->seq_id, $feat->start, "with", $feat->score, "spacers");
+    msg("CRISPR$num_crispr", $feat->seq_id, $feat->start, "with $num_rpt spacers");
   }
   msg("Found $num_crispr CRISPRs");
 }
@@ -699,10 +724,15 @@ if ($tools{'minced'}->{HAVE}) {
 
 msg("Predicting coding sequences");
 my $totalbp = sum( map { $seq{$_}{DNA}->length } @seq);
-my $prodigal_mode = ($totalbp >= 100000 && !$metagenome) ? 'single' : 'meta';
+## my $prodigal_mode = ($totalbp >= 100000 && !$metagenome) ? 'single' : 'meta';
+my $prodigal_mode = 'single';
 msg("Contigs total $totalbp bp, so using $prodigal_mode mode");
 my $num_cds=0;
 my $cmd = "prodigal -i \Q$outdir/$prefix.fna\E -c -m -g $gcode -p $prodigal_mode -f sco -q";
+if ($prodigaltf and -r $prodigaltf) {
+  msg("Gene finding will be aided by Prodigal training file: $prodigaltf");
+  $cmd .= " -t '$prodigaltf'";
+}
 msg("Running: $cmd");
 open my $PRODIGAL, '-|', $cmd;
 my $sid;
@@ -767,14 +797,15 @@ for my $sid (@seq) {
 # Find signal peptide leader sequences
 
 if ($tools{signalp}->{HAVE}) {
-  my $sigpver = substr $tools{signalp}{VERSION}, 0, 1;  # first char, expect 3 or 4
+  my $sigpver = substr $tools{signalp}{VERSION}, 0, 1;  # first char, expect 3, 4 or 5
 
-  if ($kingdom eq 'Bacteria' and $sigpver==3 || $sigpver==4) {
+  if ($kingdom eq 'Bacteria' and $sigpver==3 || $sigpver==4 || $sigpver==5) {
     if ($gram) {
       $gram = $gram =~ m/\+|[posl]/i ? 'gram+' : 'gram-';
       msg("Looking for signal peptides at start of predicted proteins");
       msg("Treating $kingdom as $gram");
       my $spoutfn = "$outdir/signalp.faa";
+      my $sp5outfn = "$outdir/signalp_summary.signalp5";
       open my $spoutfh, '>', $spoutfn;
       my $spout = Bio::SeqIO->new(-fh=>$spoutfh, -format=>'fasta');
       my %cds;
@@ -793,12 +824,17 @@ if ($tools{signalp}->{HAVE}) {
         msg("Skipping signalp because it can not handle >$SIGNALP_MAXSEQ sequences.");
       }
       else {
-        my $opts = $sigpver==3 ? '-m hmm' : '';
-        my $cmd = "signalp -t $gram -f short $opts \Q$spoutfn\E 2> /dev/null";
+        my $opts = $sigpver==3 ? "signalp -t $gram -f short -m hmm" : ($sigpver==4 ? "signalp -t $gram -f short" : '$(which signalp)'." -tmp $outdir -prefix $outdir/signalp -org $gram -format short -fasta");
+        my $cmd = "$opts \Q$spoutfn\E 2> /dev/null";
         msg("Running: $cmd");
         my $tool = "SignalP:".$tools{signalp}->{VERSION};
         my $num_sigpep = 0;
-        open SIGNALP, '-|', $cmd;
+        if ($sigpver == 3 or $sigpver == 4) {
+          open SIGNALP, '-|', $cmd;
+        } else {
+          qx($cmd);
+          open SIGNALP, '<', $sp5outfn;
+        }
         while (<SIGNALP>) {
           my @x = split m/\s+/;
           if ($sigpver == 3) {
@@ -827,8 +863,7 @@ if ($tools{signalp}->{HAVE}) {
             );
             push @{$seq{$parent->seq_id}{FEATURE}}, $sigpep;
             $num_sigpep++;
-          }
-          else {
+          } elsif ($sigpver == 4) {
     #        msg("sigp$sigpver: @x");
             next unless @x==12 and $x[9] eq 'Y'; # has sig_pep
             my $parent = $cds{ $x[0] };
@@ -854,11 +889,45 @@ if ($tools{signalp}->{HAVE}) {
             );
             push @{$seq{$parent->seq_id}{FEATURE}}, $sigpep;
             $num_sigpep++;
-          }	
+          } else {
+    #        msg("sigp$sigpver: @x");
+            next unless @x==12 and $x[1] =~ m/^SP|TAT|LIPO/; # has sig_pep
+            my $parent = $cds{ $x[0] };
+            my $tpprob;
+            if ($x[1] =~ m/^SP/) { $tpprob = $x[2] }
+            elsif ($x[1] =~ m/^TAT/) { $tpprob = $x[3] }
+            elsif ($x[1] =~ m/^LIPO/) { $tpprob = $x[4] }
+            my $type = "$x[1] (Probability: $tpprob)";
+            my ($cleave1, $cleave2) = ($1, $2) if $x[8] =~ m/(\d+)-(\d+)\./;
+            my $cleaveseq = $1 if $x[9] =~ m/(\w+-\w+)\./;
+            my $clprob = $x[11];
+            my $start = $parent->strand > 0 ? $parent->start : $parent->end;
+            # need to convert to DNA coordinates
+            my $end = $start + $parent->strand * ($cleave1*3 - 1);
+            my $sigpep = Bio::SeqFeature::Generic->new( 
+              -seq_id     => $parent->seq_id,
+              -source_tag => $tool,
+              -primary    => 'sig_peptide',
+              -start      => min($start, $end),
+              -end        => max($start, $end),
+              -strand     => $parent->strand,
+              -frame      => 0,    # PHASE: compulsory for peptides, can't be '.'
+              -tag        => {
+      #	  'ID' => $ID,
+      #	  'Parent' => $x[0],  # don't have proper IDs yet....
+                'product' => "putative signal peptide", 
+                'inference' => "ab initio prediction:$tool", 
+                'note' => "$type, predicted cleavage between residues $cleave1 and $cleave2 ($cleaveseq) with probability $clprob",
+              }
+            );
+            push @{$seq{$parent->seq_id}{FEATURE}}, $sigpep;
+            $num_sigpep++;
+          }
         }
         msg("Found $num_sigpep signal peptides");
       }
       delfile($spoutfn);
+      delfile($sp5outfn) if $sigpver == 5;
     }
     else {
       msg("Option --gram not specified, will NOT check for signal peptides.");
@@ -869,20 +938,48 @@ if ($tools{signalp}->{HAVE}) {
 # . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . 
 # Annotate CDS
 
-# primary data source is a curated subset of uniprot (evidence <= 1 per Phylum)
-my @database = (
-  {
-    DB  => "$DBDIR/kingdom/$kingdom/sprot",
-    SRC => 'similar to AA sequence:UniProtKB:',
+my @database; # list of databases to use, in priority order
+
+# https://isfinder.biotoul.fr/
+# if there is an IS (Insertion Sequence) database we use that first
+my $IS_db = "$dbdir/kingdom/$kingdom/IS";
+if (-r $IS_db) {
+  push @database, {
+    DB  => $IS_db,
+    SRC => 'similar to AA sequence:ISfinder:',
     FMT => 'blast',
     CMD => $BLASTPCMD,
-  },
-);
+    MINCOV => 90,
+    EVALUE => 1E-30,  # IS families are quite specific
+  };
+}
+
+# https://www.ncbi.nlm.nih.gov/bioproject/PRJNA313047
+# if there is an AMR (antimicrobial resitance) database we use that early on
+my $AMR_db = "$dbdir/kingdom/$kingdom/AMR";
+if (-r $AMR_db) {
+  push @database, {
+    DB  => $AMR_db,
+    SRC => 'similar to AA sequence:BARRGD:',
+    FMT => 'blast',
+    CMD => $BLASTPCMD,
+    MINCOV => 90,
+    EVALUE => 1E-300,   # need to exact alleles (~ MIN_DBL, 0.0 not accepted)
+  };
+}
+
+# primary data source is a curated subset of uniprot (evidence <= 1 per Phylum)
+push @database, {
+  DB  => "$dbdir/kingdom/$kingdom/sprot",
+  SRC => 'similar to AA sequence:UniProtKB:',
+  FMT => 'blast',
+  CMD => $BLASTPCMD,
+};
 
 # secondary sources are a series of HMMs
 unless ($kingdom eq 'Viruses') {
   for my $name ( hmms() ) {
-    my $dbfile = "$DBDIR/hmm/$name.hmm";
+    my $dbfile = "$dbdir/hmm/$name.hmm";
     if (-r $dbfile) {
       push @database, {
         DB  => $dbfile,
@@ -901,8 +998,9 @@ unless ($kingdom eq 'Viruses') {
 # if --usegenus is enabled 
 # AND user supplies a genus, and we have a custom file (from GenBank) do it first!
 if ($usegenus) {
-  if ($genus and -r "$DBDIR/genus/$genus.pin") {
-    my $blastdb = "$DBDIR/genus/$genus";
+    print "TESTME: TEST FILE $dbdir/genus/${genus}.pin\n";
+  if ($genus and -r "$dbdir/genus/$genus.pin") {
+    my $blastdb = "$dbdir/genus/$genus";
     msg("Using custom $genus database for annotation");
     unshift @database, {
       DB  => $blastdb,
@@ -912,7 +1010,7 @@ if ($usegenus) {
     };    
   }  
   else {
-    msg("Skipping genus-specific proteins as can't see $DBDIR/$genus");
+    msg("Skipping genus-specific proteins as can't see $dbdir/$genus");
   }
 }
 else {
@@ -982,8 +1080,7 @@ else {
     }
 
     # create a unqiue output name so we can save them in --debug mode
-    my $outname = $db->{DB};
-    $outname =~ s{^.*/}{};
+    my $outname = "$prefix.".basename($db->{DB}).".tmp.$$";
 
     # we write out all the CDS which haven't been annotated yet and then search them
     my $faa_name = "$outdir/$outname.faa";
@@ -1006,10 +1103,12 @@ else {
     msg("There are still $count unannotated CDS left (started with $num_cds)");
     msg("Will use", $db->{FMT}, "to search against", $db->{DB}, "with $cpus CPUs");
 
+    # fill in the custom parameters
+    my $db_evalue = exists $db->{EVALUE} ? $db->{EVALUE} : $evalue;
+    my $db_cov = exists $db->{MINCOV} ? $db->{MINCOV} : $coverage;
     my $cmd = $db->{CMD};
-#    $cmd =~ s/%i/{}/g;
-#    $cmd =~ s/%o/{}.out/g;
-    $cmd =~ s/%e/$evalue/g;
+    $cmd =~ s/%e/$db_evalue/g;
+    $cmd =~ s/%c/$db_cov/g;
     $cmd =~ s,%d,$db->{DB},g;
 
     #
@@ -1021,17 +1120,17 @@ else {
 
     my $bls_name = "$outdir/$outname.".$db->{FMT};
     runcmd(
-      "cat \Q$faa_name\E | ${PARALLELCMD}$paropts --block $bsize --recstart '>' --pipe". 
-      " $cmd > \Q$bls_name\E 2> /dev/null" 
+      "cat ${faa_name} | ${PARALLELCMD}${paropts} --block ${bsize} --recstart '>' --pipe". 
+      " ${cmd} 1>${bls_name}  2>>${bls_name}.error" 
     ); 
 
     my $num_cleaned=0;
     my $bls = Bio::SearchIO->new(-file=>$bls_name, -format=>$db->{FMT}, -version=>$db->{VERSION});
     while (my $res = $bls->next_result) {
       my $hit = $res->next_hit or next;
-      my($pid,$prod,$gene,$EC) = ($res->query_name, $hit->description, '', '');
+      my($pid,$prod,$gene,$EC,$COG) = ($res->query_name, $hit->description, '', '', '');
       if ($prod =~ m/~~~/) {
-	($EC,$gene,$prod) = split m/~~~/, $prod;
+	($EC,$gene,$prod,$COG) = split m/~~~/, $prod;
 	$EC =~ s/n\d+/-/g; # collapse transitionary EC numbers
       }
       my $cleanprod = $rawproduct ? $prod : cleanup_product($prod);      
@@ -1043,13 +1142,15 @@ else {
           # I think I still need to do this to cope with dodgy anno sources 
   	  $cds{$pid}->remove_tag('gene') if $cds{$pid}->has_tag('gene');
 	  $cds{$pid}->remove_tag('EC_number') if $cds{$pid}->has_tag('EC_number');
-	  $EC = $gene = undef;
+	  $EC = $gene = $COG = undef;
 	}
 	$num_cleaned++;
       }
       $cds{$pid}->add_tag_value('product', $cleanprod);
       $cds{$pid}->add_tag_value('EC_number', $EC) if $EC;
       $cds{$pid}->add_tag_value('gene', $gene) if $gene;
+      # https://www.ncbi.nlm.nih.gov/genbank/collab/db_xref/
+      $cds{$pid}->add_tag_value('db_xref', "COG:$COG") if $COG;  # GFF3/TSV only
       # only add /inference if this DB has a proper SRC to atrribute to
       $cds{$pid}->add_tag_value('inference', $db->{SRC}.$hit->name) if $db->{SRC};
     }
@@ -1207,7 +1308,7 @@ open my $tbl_fh, '>', "$outdir/$prefix.tbl";
 my $fsa_fh = Bio::SeqIO->new(-file=>">$outdir/$prefix.fsa", -format=>'fasta');
 
 open my $tsv_fh, '>', "$outdir/$prefix.tsv";
-print {$tsv_fh} tsv_line( qw(locus_tag ftype gene EC_number product) );
+print {$tsv_fh} tsv_line( qw(locus_tag ftype length_bp gene EC_number COG product) );
 
 my $gff_factory = Bio::Tools::GFF->new(-gff_version=>$gffver);
 print $gff_fh "##gff-version $gffver\n";
@@ -1224,7 +1325,7 @@ for my $sid (@seq) {
   $fsa_fh->write_seq($ctg);
   $ctg->desc(undef);
   print $tbl_fh ">Feature $sid\n";
-  for my $f ( sort { $a->start <=> $b->start } @{ $seq{$sid}{FEATURE} }) {
+  for my $f ( sort { $a->start <=> $b->start || $b->end <=> $a->end || $a->has_tag('Parent') <=> $b->has_tag('Parent') } @{ $seq{$sid}{FEATURE} }) {
     if ($f->primary_tag eq 'CDS' and not $f->has_tag('product')) {
       $f->add_tag_value('product', $HYPO);
     }
@@ -1263,13 +1364,18 @@ for my $sid (@seq) {
       $ffn_fh->write_seq($p);
     }
     # tab separated format.
-    print ${tsv_fh} tsv_line( map { ($_ || '') } ( 
-        TAG($f, 'locus_tag'),
-        $f->primary_tag,
-        TAG($f, 'gene'),
-        TAG($f, 'EC_number'),
-        TAG($f, 'product'),
-      ) );
+    my $COG = TAG($f, 'db_xref');
+    $COG = $1 if (defined $COG and $COG =~ m/(COG\d+)/);
+    my @values = (
+      TAG($f, 'locus_tag'),
+      $f->primary_tag,
+      $f->length,
+      TAG($f, 'gene'),
+      TAG($f, 'EC_number'),
+      $COG,
+      TAG($f, 'product'),
+    );
+    print ${tsv_fh} tsv_line( map { $_ || '' } @values );
   }
 }
 
@@ -1298,7 +1404,7 @@ for my $sid (@seq) {
     $count{ $f->primary_tag }++;
   }
 }
-for my $ft (keys %count) {
+for my $ft (sort keys %count) {
   printf "%s: %d\n", $ft, $count{$ft};
 }
 
@@ -1376,6 +1482,9 @@ sub cleanup_product {
   if ($p =~ m/(domain|family|binding|fold|like|motif|repeat)\s*$/i and $p !~ m/,/)  {
     $p .= " protein";
   }
+  
+  $p =~ s/\s+/ /g;  # make multiple spaces into 1 space
+  
   return $p;
 }
 
@@ -1383,7 +1492,9 @@ sub cleanup_product {
 
 sub TAG {
   my($f, $tag) = @_;
-  return unless $f->has_tag($tag);
+  # very important to "return undef" here and not just "return"
+  # otherwise it becomes non-existent/collapsed in a list 
+  return undef unless $f->has_tag($tag);
   return ($f->get_tag_values($tag))[0];
 }
 
@@ -1452,7 +1563,7 @@ sub err {
 
 sub runcmd {
   msg("Running:", @_);
-  system(@_)==0 or err("Could not run command:", @_);
+  system(@_)==0 or warn("Could not run command:", @_);
 }
 
 #----------------------------------------------------------------------
@@ -1473,13 +1584,6 @@ sub delfile {
 
 sub version {
   print STDERR "$EXE $VERSION\n";
-  exit;
-}
-
-#----------------------------------------------------------------------
-
-sub showdoc {
-  system("less $FindBin::Bin/../doc/$EXE-manual.txt");
   exit;
 }
 
@@ -1518,25 +1622,25 @@ sub add_bundle_to_path {
 #----------------------------------------------------------------------
 
 sub kingdoms {
-  return map { m{kingdom/(\w+?)/}; $1 } glob("$DBDIR/kingdom/*/*.pin");
+  return uniq map { m{kingdom/(\w+?)/}; $1 } glob("$dbdir/kingdom/*/*.pin");
 }
 
 sub genera {
-  return map { m{([^/]+)(\.\d+)?\.pin$}; $1 } glob("$DBDIR/genus/*.pin");
+  return map { m{([^/]+)(\.\d+)?\.pin$}; $1 } glob("$dbdir/genus/*.pin");
 }
 
 sub hmms {
-  return map { m{([^/]+)\.hmm\.h3m$}; $1 } glob("$DBDIR/hmm/*.h3m");
+  return map { m{([^/]+)\.hmm\.h3m$}; $1 } glob("$dbdir/hmm/*.h3m");
 }
 
 sub cms {
-  return map { m{([^/]+)\.i1m$}; $1 } glob("$DBDIR/cm/*.i1m");
+  return map { m{([^/]+)\.i1m$}; $1 } glob("$dbdir/cm/*.i1m");
 }
 
 #----------------------------------------------------------------------
 
 sub list_db {
-  msg( "Looking for databases in: $DBDIR" );
+  msg( "Looking for databases in: $dbdir" );
   msg( "* Kingdoms:", kingdoms() );
   msg( "* Genera:", genera() );
   msg( "* HMMs:", hmms() );
@@ -1550,26 +1654,30 @@ sub setup_db {
 
   add_bundle_to_path();
 
-  clean_db();
+  clean_db(0);  # don't quit, come back here
 
   check_tool('makeblastdb');
-   for my $sprot (<$DBDIR/kingdom/*/sprot>) {
-    msg("Making kingdom BLASTP database: $sprot");
-    runcmd("makeblastdb -hash_index -dbtype prot -in \Q$sprot\E -logfile /dev/null");
+
+  for my $db (qw/sprot IS AMR/) {
+    for my $fasta (<$dbdir/kingdom/*/$db>) {
+      next unless -r $fasta;
+      msg("Making kingdom BLASTP database: $fasta");
+      runcmd("makeblastdb -hash_index -dbtype prot -in \Q$fasta\E -logfile /dev/null");
+    }
   }
-  for my $genus (<$DBDIR/genus/*>) {
+  for my $genus (<$dbdir/genus/*>) {
     msg("Making genus BLASTP database: $genus");
     runcmd("makeblastdb -hash_index -dbtype prot -in \Q$genus\E -logfile /dev/null");
   }
 
   check_tool('hmmpress');
-  for my $hmm (<$DBDIR/hmm/*.hmm>) {
+  for my $hmm (<$dbdir/hmm/*.hmm>) {
     msg("Pressing HMM database: $hmm");
     runcmd("hmmpress \Q$hmm\E");
   }
 
   check_tool('cmpress');
-  for my $cm (<$DBDIR/cm/{Viruses,Bacteria}>) {
+  for my $cm (<$dbdir/cm/{Viruses,Bacteria,Archaea}>) {
     msg("Pressing CM database: $cm");    
     runcmd("cmpress \Q$cm\E");
   }
@@ -1580,12 +1688,14 @@ sub setup_db {
 #----------------------------------------------------------------------
 
 sub clean_db {
-  msg("Cleaning databases in $DBDIR");
-  delfile( <$DBDIR/kingdom/*/sprot.p??> );
-  delfile( <$DBDIR/genus/*.p??> );
-  delfile( <$DBDIR/hmm/*.h3?> );
-  delfile( <$DBDIR/cm/*.i1?> );
+  my($quit) = @_;
+  msg("Cleaning databases in $dbdir");
+  delfile( <$dbdir/kingdom/*/*.p??> );
+  delfile( <$dbdir/genus/*.p??> );
+  delfile( <$dbdir/hmm/*.h3?> );
+  delfile( <$dbdir/cm/*.i1?> );
   msg("Cleaning complete.");
+  exit(0) if $quit;
 }
 
 #----------------------------------------------------------------------
@@ -1636,11 +1746,11 @@ sub setOptions {
     'General:',
     {OPT=>"help",    VAR=>\&usage,             DESC=>"This help"},
     {OPT=>"version", VAR=>\&version, DESC=>"Print version and exit"},
-    {OPT=>"docs",    VAR=>\&showdoc,           DESC=>"Show full manual/documentation"},
     {OPT=>"citation",VAR=>\&show_citation,     DESC=>"Print citation for referencing Prokka"},
     {OPT=>"quiet!",  VAR=>\$quiet, DEFAULT=>0, DESC=>"No screen output"},
     {OPT=>"debug!",  VAR=>\$debug, DEFAULT=>0, DESC=>"Debug mode: keep all temporary files"},
     'Setup:',
+    {OPT=>"dbdir=s",  VAR=>\$dbdir, DEFAULT=>$dbdir, DESC=>"Prokka database root folders"},
     {OPT=>"listdb",   VAR=>\&list_db,    DESC=>"List all configured databases"},
     {OPT=>"setupdb",  VAR=>\&setup_db,         DESC=>"Index all installed databases"},
     {OPT=>"cleandb",  VAR=>\&clean_db,         DESC=>"Remove all database indices"},
@@ -1666,6 +1776,7 @@ sub setOptions {
     'Annotations:',
     {OPT=>"kingdom=s",  VAR=>\$kingdom, DEFAULT=>'Bacteria', DESC=>"Annotation mode: ".join('|', kingdoms()) },
     {OPT=>"gcode=i",  VAR=>\$gcode, DEFAULT=>0, DESC=>"Genetic code / Translation table (set if --kingdom is set)"},
+    {OPT=>"prodigaltf=s",  VAR=>\$prodigaltf, DEFAULT=>'', DESC=>"Prodigal training file" },
     {OPT=>"gram=s",  VAR=>\$gram, DEFAULT=>'', DESC=>"Gram: -/neg +/pos"},
     {OPT=>"usegenus!",  VAR=>\$usegenus, DEFAULT=>0, DESC=>"Use genus-specific BLAST databases (needs --genus)"},
     {OPT=>"proteins=s",  VAR=>\$proteins, DEFAULT=>'', DESC=>"FASTA or GBK file to use as 1st priority"},
@@ -1673,22 +1784,23 @@ sub setOptions {
     {OPT=>"metagenome!",  VAR=>\$metagenome, DEFAULT=>0, DESC=>"Improve gene predictions for highly fragmented genomes"},
     {OPT=>"rawproduct!",  VAR=>\$rawproduct, DEFAULT=>0, DESC=>"Do not clean up /product annotation"},
     {OPT=>"cdsrnaolap!",  VAR=>\$cds_rna_olap, DEFAULT=>0, DESC=>"Allow [tr]RNA to overlap CDS"},
+    'Matching:',
+    {OPT=>"evalue=f",  VAR=>\$evalue, DEFAULT=>1E-9, DESC=>"Similarity e-value cut-off"},
+    {OPT=>"coverage=f",  VAR=>\$coverage, DEFAULT=>80, DESC=>"Minimum coverage on query protein"},
     'Computation:',
     {OPT=>"cpus=i",  VAR=>\$cpus, DEFAULT=>8, DESC=>"Number of CPUs to use [0=all]"},
     {OPT=>"fast!",  VAR=>\$fast, DEFAULT=>0, DESC=>"Fast mode - only use basic BLASTP databases"},
     {OPT=>"noanno!",  VAR=>\$noanno, DEFAULT=>0, DESC=>qq'For CDS just set /product="$UNANN"'},
     {OPT=>"mincontiglen=i",  VAR=>\$mincontiglen, DEFAULT=>1, DESC=>"Minimum contig size [NCBI needs 200]"},
-    {OPT=>"evalue=f",  VAR=>\$evalue, DEFAULT=>1E-6, DESC=>"Similarity e-value cut-off"},
-#    {OPT=>"coverage=f",  VAR=>\$coverage, DEFAULT=>0, DESC=>"Similarity \%id cut-off (otherwise /pseudo)"},
     {OPT=>"rfam",  VAR=>\$rfam, DEFAULT=>0, DESC=>"Enable searching for ncRNAs with Infernal+Rfam (SLOW!)"},
     {OPT=>"norrna!",  VAR=>\$norrna, DEFAULT=>0, DESC=>"Don't run rRNA search"},
     {OPT=>"notrna!",  VAR=>\$notrna, DEFAULT=>0, DESC=>"Don't run tRNA search"},
     {OPT=>"rnammer!",  VAR=>\$rnammer, DEFAULT=>0, DESC=>"Prefer RNAmmer over Barrnap for rRNA prediction"},
   );
 
-  (!@ARGV) && (usage());
+  (!@ARGV) && (usage(1));
 
-  &GetOptions(map {$_->{OPT}, $_->{VAR}} grep { ref } @Options) || usage();
+  &GetOptions(map {$_->{OPT}, $_->{VAR}} grep { ref } @Options) || usage(1);
 
   # Now setup default values.
   foreach (@Options) {
@@ -1699,7 +1811,12 @@ sub setOptions {
 }
 
 sub usage {
-  print STDERR 
+  my($exitcode) = @_;
+  $exitcode ||= 0;
+  $exitcode = 0 if $exitcode eq 'help';  # what gets passed by getopt func ref
+  select STDERR if $exitcode;            # write to STDERR if exitcode is error
+
+  print
     "Name:\n  ", ucfirst($EXE), " $VERSION by $AUTHOR\n",
     "Synopsis:\n  rapid bacterial genome annotation\n",
     "Usage:\n  $EXE [options] <contigs.fasta>\n";
@@ -1712,13 +1829,13 @@ sub usage {
       $opt =~ s/=s$/ [X]/; 
       $opt =~ s/=i$/ [N]/;
       $opt =~ s/=f$/ [n.n]/;
-      printf STDERR "  --%-15s %s%s\n", $opt, $_->{DESC}, $def;
+      printf STDERR "  --%-16s %s%s\n", $opt, $_->{DESC}, $def;
     }
     else {
-      print STDERR "$_\n";
+      print "$_\n"; # Subheadings in the help output
     }      
   }
-  exit(1);
+  exit($exitcode);
 }
 
 __DATA__
